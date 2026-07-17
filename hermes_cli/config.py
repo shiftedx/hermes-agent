@@ -989,6 +989,19 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 90,
+        # Per-turn tool-call budget.  Once the model has dispatched this many
+        # tool calls within a single turn, every remaining completion call in
+        # that turn is made tool-free (the ``tools`` parameter is omitted
+        # entirely), forcing the model to produce a final answer instead of
+        # looping another tool call.  Composes with tool_use_enforcement and
+        # intent_ack_continuation: once the budget has withheld tools, neither
+        # nudges the model back into a tool call — enforcement only applies
+        # while tools are still offered.  The counter is per-turn (it resets at
+        # the start of every agent invocation and is never inherited by a
+        # subagent).  0 = off (default); negative or non-integer values are
+        # treated as off.  Aimed at small local models that loop many
+        # successful tool calls per turn without ever answering.
+        "max_tools_per_turn": 0,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

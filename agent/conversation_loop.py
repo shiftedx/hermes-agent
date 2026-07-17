@@ -626,6 +626,12 @@ def run_conversation(
     # over instead of spinning. Reset here so each turn starts fresh. See #26080.
     agent._auth_pool_refresh_counts = {}
 
+    # Per-turn tool-call budget counter. The budget (agent.max_tools_per_turn)
+    # is per invocation, not per session: reset the dispatch tally here so each
+    # turn starts with the full allotment and a prior turn's exhausted budget
+    # never carries into the next one.
+    agent._tools_dispatched_this_turn = 0
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -5081,6 +5087,12 @@ def run_conversation(
                 _ack_mode = intent_ack_continuation_mode(agent)
                 if (
                     _ack_mode != "off"
+                    # Per-turn tool budget composition: once the budget has
+                    # withheld tools, this text IS the forced final answer.
+                    # Enforcement only applies while tools are still offered, so
+                    # do not nudge the model back into a tool call it can no
+                    # longer make — accept the answer as final.
+                    and not agent._tool_budget_reached()
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
                     and agent._looks_like_codex_intermediate_ack(
