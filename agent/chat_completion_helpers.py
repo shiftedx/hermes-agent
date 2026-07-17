@@ -686,6 +686,18 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
 
+    # Per-turn tool-call budget: once this turn has dispatched its allotment of
+    # tool calls, withhold tools from every remaining completion call so the
+    # model must produce a final answer.  We drop ``tools`` to None — every
+    # transport's build_kwargs omits the ``tools`` parameter entirely when it is
+    # falsy (``if tools:``), which is the most compatible shape for the
+    # OpenAI-compatible local inference servers this targets (preferred over
+    # ``tool_choice: "none"``).  This is the single request-build choke point,
+    # so gating here covers chat_completions, anthropic_messages, codex_responses
+    # and bedrock_converse alike.  No-op when the budget is off.
+    if agent._tool_budget_reached():
+        tools_for_api = None
+
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)

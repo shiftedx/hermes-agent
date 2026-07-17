@@ -269,6 +269,7 @@ def init_agent(
     args: list[str] | None = None,
     model: str = "",
     max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+    max_tools_per_turn: int = 0,  # Per-turn tool-call budget (0 = off)
     tool_delay: float = 1.0,
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
@@ -341,6 +342,11 @@ def init_agent(
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
+        max_tools_per_turn (int): Per-turn tool-call budget. Once this many
+            tool calls have been dispatched in a single turn, subsequent
+            completion calls are made tool-free so the model must answer.
+            0 = off (default). Falls back to config agent.max_tools_per_turn
+            when the constructor arg is unset; negative/invalid values are off.
         tool_delay (float): Delay between tool calls in seconds (default: 1.0)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
@@ -1441,6 +1447,26 @@ def init_agent(
     # model-name substrings.  Resolved against the active api_mode/model in the
     # conversation loop's intent-ack block.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
+
+    # Per-turn tool-call budget.  Once this many tool calls have been dispatched
+    # in a single turn, ``build_api_kwargs`` withholds the ``tools`` parameter
+    # so the next completion must answer (see ``_tool_budget_reached`` and the
+    # intent-ack gate in the conversation loop).  The explicit constructor arg
+    # wins; otherwise read the agent-block config key (same block as max_turns /
+    # tool_use_enforcement).  Negative or non-integer values fall back to off.
+    _mtpt_raw = (
+        max_tools_per_turn
+        if max_tools_per_turn
+        else _agent_section.get("max_tools_per_turn", 0)
+    )
+    try:
+        agent.max_tools_per_turn = max(0, int(_mtpt_raw))
+    except (TypeError, ValueError):
+        agent.max_tools_per_turn = 0
+    # Per-turn dispatch counter — fresh on every new agent instance so a
+    # subagent / background-review fork never inherits an exhausted budget.
+    # The conversation loop also resets it at the start of each invocation.
+    agent._tools_dispatched_this_turn = 0
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance

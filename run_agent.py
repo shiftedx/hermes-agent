@@ -425,6 +425,7 @@ class AIAgent:
         args: list[str] | None = None,
         model: str = "",
         max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_tools_per_turn: int = 0,  # Per-turn tool-call budget (0 = off); config agent.max_tools_per_turn
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -501,6 +502,7 @@ class AIAgent:
             args=args,
             model=model,
             max_iterations=max_iterations,
+            max_tools_per_turn=max_tools_per_turn,
             tool_delay=tool_delay,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
@@ -5661,6 +5663,20 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
+    def _tool_budget_reached(self) -> bool:
+        """True once this turn has dispatched its per-turn tool-call budget.
+
+        When True, ``build_api_kwargs`` withholds the ``tools`` parameter so the
+        next completion call must produce a final answer, and the conversation
+        loop's intent-ack continuation is suppressed (enforcement only applies
+        while tools are still offered).  Always False when ``max_tools_per_turn``
+        is unset/<= 0, so the default path is byte-identical to before.
+        """
+        budget = getattr(self, "max_tools_per_turn", 0) or 0
+        if budget <= 0:
+            return False
+        return getattr(self, "_tools_dispatched_this_turn", 0) >= budget
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
@@ -5669,6 +5685,17 @@ class AIAgent:
         file reads/writes may do so only when their target paths do not overlap.
         """
         tool_calls = assistant_message.tool_calls
+
+        # Per-turn tool-call budget accounting.  Count every tool call dispatched
+        # to a tool executor this turn; once the tally reaches
+        # ``max_tools_per_turn`` the next completion call is made tool-free (see
+        # ``_tool_budget_reached``).  Counting here — the single dispatch choke
+        # point for both the concurrent and sequential paths — keeps the tally
+        # consistent regardless of batch shape.  When the budget is off the
+        # tally is simply ignored by ``_tool_budget_reached``.
+        self._tools_dispatched_this_turn = (
+            getattr(self, "_tools_dispatched_this_turn", 0) + len(tool_calls or [])
+        )
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
