@@ -156,6 +156,18 @@ def _has_tools(req: dict) -> bool:
     return bool(req.get("tools"))
 
 
+def _has_wrapup_note(req: dict) -> bool:
+    """Whether the request carries the one-time tool-budget wrap-up system note."""
+    from agent.chat_completion_helpers import _TOOL_BUDGET_WRAPUP_NOTE
+
+    return any(
+        isinstance(m, dict)
+        and m.get("role") == "system"
+        and m.get("content") == _TOOL_BUDGET_WRAPUP_NOTE
+        for m in (req.get("messages") or [])
+    )
+
+
 def _chat_requests(handler) -> list:
     """Only the chat-completion calls (skip model-probe / warmup POSTs)."""
     return [r for r in handler.captured_requests if "messages" in r]
@@ -201,6 +213,50 @@ def test_e2e_default_off_offers_tools_on_every_call(agent_env):
     reqs = _chat_requests(handler)
     assert len(reqs) == 4
     assert all(_has_tools(r) for r in reqs)      # tools offered on every call
+
+
+def test_e2e_wrapup_note_on_wire_when_tools_withheld(agent_env):
+    """Budget N=2: the tool-free third request carries BOTH omitted tools AND the
+    one-time wrap-up system note — the fix that keeps an enforcement-prompted
+    model from returning empty once tools disappear. The note rides exactly one
+    request, and a plain-text answer ends the turn cleanly."""
+    agent, handler = agent_env
+    agent.max_tools_per_turn = 2
+    handler.response_queue = [
+        _tc_resp("session_search", "c1", '{"q":"one"}'),
+        _tc_resp("terminal", "c2", '{"command":"echo two"}'),
+        _text_resp("Here is the final answer, in plain text."),
+    ]
+
+    result = agent.run_conversation("do the multi-step thing",
+                                    conversation_history=[], task_id="t")
+
+    reqs = _chat_requests(handler)
+    assert len(reqs) == 3
+    # Under budget: tools offered, no wrap-up note.
+    assert _has_tools(reqs[0]) is True and _has_wrapup_note(reqs[0]) is False
+    assert _has_tools(reqs[1]) is True and _has_wrapup_note(reqs[1]) is False
+    # Budget reached: tools withheld AND the wrap-up note present.
+    assert _has_tools(reqs[2]) is False
+    assert _has_wrapup_note(reqs[2]) is True
+    # Exactly one request across the turn carries the note.
+    assert sum(_has_wrapup_note(r) for r in reqs) == 1
+    assert result["final_response"] == "Here is the final answer, in plain text."
+
+
+def test_e2e_no_wrapup_note_when_budget_off(agent_env):
+    """Budget off (default 0): no request ever carries the wrap-up note."""
+    agent, handler = agent_env
+    assert agent.max_tools_per_turn == 0
+    handler.response_queue = [
+        _tc_resp("session_search", "c1", '{"q":"one"}'),
+        _text_resp("All done."),
+    ]
+
+    agent.run_conversation("keep going", conversation_history=[], task_id="t")
+
+    reqs = _chat_requests(handler)
+    assert all(not _has_wrapup_note(r) for r in reqs)
 
 
 def test_e2e_budget_tripped_ack_text_is_accepted_as_final(agent_env):

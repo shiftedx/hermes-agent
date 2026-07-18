@@ -82,6 +82,20 @@ def _tools_offered(agent):
     return bool(kwargs.get("tools"))
 
 
+from agent.chat_completion_helpers import _TOOL_BUDGET_WRAPUP_NOTE
+
+
+def _wrapup_count(messages):
+    """How many one-time tool-budget wrap-up system notes are in ``messages``."""
+    return sum(
+        1
+        for m in messages
+        if isinstance(m, dict)
+        and m.get("role") == "system"
+        and m.get("content") == _TOOL_BUDGET_WRAPUP_NOTE
+    )
+
+
 # ── _tool_budget_reached predicate ───────────────────────────────────────────
 
 def test_budget_off_by_default_never_reached(monkeypatch):
@@ -169,6 +183,108 @@ def test_parallel_batch_counts_every_call_in_the_batch(monkeypatch):
     agent._execute_tool_calls(_assistant_with_tools("web_search", "terminal", "web_search"), [], "task")
     assert agent._tools_dispatched_this_turn == 3
     assert _tools_offered(agent) is False
+
+
+# ── one-time tool-budget wrap-up note ────────────────────────────────────────
+# When the budget withholds tools, a model whose static system prompt still
+# commands tool use can return an empty response and die
+# ``empty_response_exhausted``. build_api_kwargs appends a single system-channel
+# note so the model answers in plain text instead. It must fire exactly once per
+# turn and never when the budget is off.
+
+def test_wrapup_note_injected_once_when_budget_trips(monkeypatch):
+    agent = _make_agent(monkeypatch, max_tools_per_turn=1)
+    agent._tool_budget_wrapup_injected = False
+    agent._tools_dispatched_this_turn = 1  # budget reached → tools withheld
+
+    api_messages = [{"role": "user", "content": "hi"}]
+    kwargs = agent._build_api_kwargs(api_messages)
+
+    assert bool(kwargs.get("tools")) is False          # tools withheld
+    assert _wrapup_count(api_messages) == 1            # note appended once
+    assert agent._tool_budget_wrapup_injected is True  # latch set
+
+
+def test_wrapup_note_not_duplicated_within_the_same_turn(monkeypatch):
+    """Network retries reuse the same api_messages list; empty-response retries
+    rebuild it fresh. Neither re-fires the note — inject exactly once per turn."""
+    agent = _make_agent(monkeypatch, max_tools_per_turn=1)
+    agent._tool_budget_wrapup_injected = False
+    agent._tools_dispatched_this_turn = 1
+
+    # Same-list reuse (network retry): note stays at exactly one.
+    shared = [{"role": "user", "content": "hi"}]
+    agent._build_api_kwargs(shared)
+    agent._build_api_kwargs(shared)
+    assert _wrapup_count(shared) == 1
+
+    # Rebuilt list (outer-loop empty-response retry): latch already set → none.
+    rebuilt = [{"role": "user", "content": "hi"}]
+    agent._build_api_kwargs(rebuilt)
+    assert _wrapup_count(rebuilt) == 0
+
+
+def test_wrapup_note_absent_when_budget_off(monkeypatch):
+    """Budget off (0): no note ever, and the passed message list is untouched."""
+    agent = _make_agent(monkeypatch)  # max_tools_per_turn defaults to 0
+    for tally in (0, 1, 50):
+        agent._tools_dispatched_this_turn = tally
+        msgs = [{"role": "user", "content": "hi"}]
+        agent._build_api_kwargs(msgs)
+        assert _wrapup_count(msgs) == 0
+        assert msgs == [{"role": "user", "content": "hi"}]  # zero new messages
+    assert getattr(agent, "_tool_budget_wrapup_injected", False) is False
+
+
+# ── cross-transport safety: the note must augment, not clobber, the Anthropic
+#    system prompt (Anthropic takes a single ``system`` param) ────────────────
+
+def test_anthropic_single_system_message_extraction_unchanged():
+    """Byte-identical with one system message: string and cache_control-list
+    shapes are both returned verbatim (no accumulation path taken)."""
+    from agent.anthropic_adapter import convert_messages_to_anthropic
+
+    sys_str, _ = convert_messages_to_anthropic(
+        [{"role": "system", "content": "PRIMARY PROMPT"},
+         {"role": "user", "content": "hi"}]
+    )
+    assert sys_str == "PRIMARY PROMPT"
+
+    blocks = [{"type": "text", "text": "CACHED",
+               "cache_control": {"type": "ephemeral"}}]
+    sys_list, _ = convert_messages_to_anthropic(
+        [{"role": "system", "content": blocks},
+         {"role": "user", "content": "hi"}]
+    )
+    assert sys_list == blocks
+
+
+def test_anthropic_appended_wrapup_augments_not_clobbers():
+    """A trailing wrap-up system message accumulates into the byte-stable
+    primary prompt instead of overwriting it (pre-fix last-writer-wins bug)."""
+    from agent.anthropic_adapter import convert_messages_to_anthropic
+
+    # String primary → concatenated, primary preserved.
+    sys_str, _ = convert_messages_to_anthropic([
+        {"role": "system", "content": "PRIMARY PROMPT"},
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": _TOOL_BUDGET_WRAPUP_NOTE},
+    ])
+    assert "PRIMARY PROMPT" in sys_str
+    assert _TOOL_BUDGET_WRAPUP_NOTE in sys_str
+
+    # cache_control-list primary → note added as a trailing text block; the
+    # cached breakpoint on the primary block is untouched.
+    blocks = [{"type": "text", "text": "CACHED",
+               "cache_control": {"type": "ephemeral"}}]
+    sys_list, _ = convert_messages_to_anthropic([
+        {"role": "system", "content": blocks},
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": _TOOL_BUDGET_WRAPUP_NOTE},
+    ])
+    assert isinstance(sys_list, list)
+    assert sys_list[0] == blocks[0]  # primary (cached) block intact
+    assert sys_list[-1] == {"type": "text", "text": _TOOL_BUDGET_WRAPUP_NOTE}
 
 
 # ── config plumbing ──────────────────────────────────────────────────────────
