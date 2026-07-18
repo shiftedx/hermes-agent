@@ -9210,6 +9210,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key, _stale_age, _stale_idle,
                     _raw_stale_timeout, _stale_detail,
                 )
+                # Abort the orphaned run as we reclaim its slot.  Freeing the
+                # slot without interrupting lets a stale-but-still-alive run
+                # keep executing AFTER a replacement turn claims the session:
+                # on a serial local-inference backend an api call can stall
+                # past the idle timeout, get evicted here, then unblock and
+                # grind its remaining api calls CONCURRENTLY with the new turn
+                # the current (e.g. steer) message is about to spawn — the
+                # "twin sessions contending on the serial backend" double-run.
+                # interrupt() sets _interrupt_requested so the orphan bails at
+                # its next check-point instead of racing the replacement.  The
+                # run generation is invalidated immediately below, so the
+                # orphan's eventual result is dropped either way; this just
+                # stops it from doing concurrent work in the meantime.  Mirrors
+                # _interrupt_and_clear_session (/stop) and the inactivity-
+                # timeout path, both of which already interrupt before
+                # releasing.  Guarded so a hung/odd agent object never blocks
+                # the eviction itself.
+                if _stale_agent is not None and _stale_agent is not _AGENT_PENDING_SENTINEL:
+                    try:
+                        _stale_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                    except Exception:
+                        logger.debug(
+                            "Failed to interrupt stale agent during eviction for %s",
+                            _quick_key, exc_info=True,
+                        )
                 self._invalidate_session_run_generation(
                     _quick_key,
                     reason="stale_running_agent_eviction",

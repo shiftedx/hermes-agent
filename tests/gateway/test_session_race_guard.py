@@ -550,3 +550,88 @@ async def test_shutdown_skips_sentinel():
     # Real agent should have been interrupted
     real_agent.interrupt.assert_called_once()
     # Should not have raised on the sentinel
+
+
+# ------------------------------------------------------------------
+# Test 8: stale-eviction ABORTS the orphaned run before reclaiming the
+# slot (shape-2 twin-session guard).
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_stale_eviction_interrupts_orphaned_agent():
+    """When a message arrives on a session whose running agent has gone
+    idle past HERMES_AGENT_TIMEOUT, the stale-eviction path must call
+    interrupt() on the orphan BEFORE releasing the slot.
+
+    Without the interrupt, a stale-but-still-alive run — e.g. a serial
+    local-inference api call that stalled past the idle timeout and then
+    unblocks — keeps grinding its remaining api calls concurrently with the
+    replacement turn this message spawns: the 'twin sessions contending on
+    the serial backend' double-run.  The run generation is bumped either
+    way (the orphan's result is dropped), but interrupting stops the
+    concurrent work.  This mirrors /stop and the inactivity-timeout path,
+    which already interrupt before releasing.
+    """
+    import time as _time
+
+    runner = _make_runner()
+    session_key = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345",
+                      chat_type="dm", user_id="u1")
+    )
+
+    # A stale (idle past the 1800s default timeout) but still-registered agent.
+    orphan = MagicMock()
+    orphan.get_activity_summary.return_value = {
+        "seconds_since_activity": 5000.0,
+        "api_call_count": 4,
+        "max_iterations": 30,
+        "last_activity_desc": "waiting for provider response (streaming)",
+    }
+    runner._running_agents[session_key] = orphan
+    runner._running_agents_ts[session_key] = _time.time() - 6000  # old wall age
+    runner._session_run_generation[session_key] = 7
+
+    # Let the cold path that follows eviction terminate cheaply.
+    async def _noop_inner(self_inner, ev, src, qk, generation):
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", _noop_inner):
+        await runner._handle_message(_make_event(text="are you still there?"))
+
+    # The orphan was interrupted with the timeout reason, exactly once.
+    orphan.interrupt.assert_called_once_with("Execution timed out (inactivity)")
+    # And the run generation was bumped past the orphan's (its result will
+    # be discarded by the run-generation guard on the way out).
+    assert runner._session_run_generation[session_key] > 7
+
+
+@pytest.mark.asyncio
+async def test_active_agent_is_not_evicted_or_interrupted():
+    """Regression guard for the eviction change: an actively-working agent
+    (recent activity) must NOT be interrupted — only genuinely idle-past-
+    timeout runs are evicted.  A steer-mode follow-up on a live agent folds
+    in via steer(), it does not abort the turn."""
+    runner = _make_runner()
+    runner._busy_input_mode = "steer"
+    session_key = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345",
+                      chat_type="dm", user_id="u1")
+    )
+
+    live = MagicMock()
+    live.get_activity_summary.return_value = {"seconds_since_activity": 3.0}
+    live.steer.return_value = True
+    live._active_children = []
+    runner._running_agents[session_key] = live
+    import time as _time
+    # Older than the 3s Telegram follow-up grace (so it reaches the steer
+    # branch) but far below the idle-eviction timeout (so it is not evicted).
+    runner._running_agents_ts[session_key] = _time.time() - 30
+
+    result = await runner._handle_message(_make_event(text="also check the logs"))
+
+    # Live agent steered, never interrupted, still registered.
+    live.interrupt.assert_not_called()
+    live.steer.assert_called_once_with("also check the logs")
+    assert runner._running_agents.get(session_key) is live
+    assert result is None

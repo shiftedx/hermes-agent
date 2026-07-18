@@ -568,6 +568,16 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Terminal seal for the steer slot.  Set atomically (under
+    # ``_pending_steer_lock``) by the turn-END drain so a steer that races
+    # the finalizing turn cannot be stranded on an agent whose turn already
+    # drained + released.  Once sealed, ``steer()`` REJECTS (returns False)
+    # and the gateway busy-steer path falls back to queue semantics, so the
+    # text is delivered as exactly one follow-up turn instead of being lost
+    # (shape 1) or double-delivered (shape 2).  Reset to False at the top of
+    # each ``run_conversation`` turn so a reused/cached agent accepts steers
+    # again on its next turn.
+    agent._pending_steer_sealed: bool = False
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker

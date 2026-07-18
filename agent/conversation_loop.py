@@ -637,6 +637,13 @@ def run_conversation(
     # can fire again next turn, but only once within this turn.
     agent._tool_budget_wrapup_injected = False
 
+    # Per-turn reset of the steer seal.  The prior turn's finalizer (or an
+    # interrupt-abort exit) sealed the slot so a late steer could not strand
+    # itself on a finalizing agent; a fresh turn must accept steers again.
+    # Reset here, in the prologue, so a reused/cached agent — including one
+    # picked up to run a resubmitted leftover-steer turn — starts unsealed.
+    agent._pending_steer_sealed = False
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -1590,14 +1597,21 @@ def run_conversation(
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
+                            # Seal + capture any pending steer BEFORE clear_interrupt
+                            # (which otherwise drops it) so an abort during retry
+                            # wait re-delivers the steer as one follow-up turn.
+                            _abort_steer = agent._seal_and_drain_pending_steer()
                             agent.clear_interrupt()
-                            return {
+                            _abort_result = {
                                 "final_response": _interrupt_text,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "interrupted": True,
                             }
+                            if _abort_steer:
+                                _abort_result["pending_steer"] = _abort_steer
+                            return _abort_result
                         time.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
                         # monitor knows we're alive during backoff waits.
@@ -3020,14 +3034,20 @@ def run_conversation(
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
+                    # Seal + capture any pending steer before clear_interrupt drops
+                    # it, so an abort mid error-handling re-delivers it as one turn.
+                    _abort_steer = agent._seal_and_drain_pending_steer()
                     agent.clear_interrupt()
-                    return {
+                    _abort_result = {
                         "final_response": _interrupt_text,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "interrupted": True,
                     }
+                    if _abort_steer:
+                        _abort_result["pending_steer"] = _abort_steer
+                    return _abort_result
                 
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
                 # A 413 is a payload-size error — the correct response is to
@@ -4169,14 +4189,20 @@ def run_conversation(
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
+                        # Seal + capture any pending steer before clear_interrupt
+                        # drops it, so an abort during backoff re-delivers it.
+                        _abort_steer = agent._seal_and_drain_pending_steer()
                         agent.clear_interrupt()
-                        return {
+                        _abort_result = {
                             "final_response": _interrupt_text,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "interrupted": True,
                         }
+                        if _abort_steer:
+                            _abort_result["pending_steer"] = _abort_steer
+                        return _abort_result
                     time.sleep(0.2)  # Check interrupt every 200ms
                     # Touch activity every ~30s so the gateway's inactivity
                     # monitor knows we're alive during backoff waits.
