@@ -631,6 +631,11 @@ def run_conversation(
     # turn starts with the full allotment and a prior turn's exhausted budget
     # never carries into the next one.
     agent._tools_dispatched_this_turn = 0
+    # Companion latch for the one-time tool-budget wrap-up note (build_api_kwargs
+    # appends a single system-channel "tools are gone, answer in plain text" note
+    # on the first budget-tripped completion call). Reset per turn so the note
+    # can fire again next turn, but only once within this turn.
+    agent._tool_budget_wrapup_injected = False
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching

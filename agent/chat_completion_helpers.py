@@ -51,6 +51,23 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+# One-time system-channel wrap-up injected on the first completion call of a
+# turn whose per-turn tool budget (``agent.max_tools_per_turn``) has tripped and
+# is withholding tools.  The model's STATIC system prompt still carries the
+# tool_use_enforcement text commanding it to always call tools; once tools are
+# gone, enforcement-prompted local reasoning models (observed live on an
+# ornith 35B reasoning model under the lmstudio api_mode) return an EMPTY
+# response — no content, no reasoning — and the empty-response retry then dies
+# with ``empty_response_exhausted`` and no answer delivered.  This note tells the
+# model tools are gone for the rest of the turn and a plain-text final answer is
+# expected.  Kept terse and in the codebase's imperative prompt voice (cf.
+# ``handle_max_iterations``' summary request).
+_TOOL_BUDGET_WRAPUP_NOTE = (
+    "This turn's tool budget is exhausted. Tools are no longer available for the "
+    "rest of this turn — do not attempt any tool calls. Write your final answer "
+    "for the user now, in plain text."
+)
+
 
 def _ra():
     """Lazy ``run_agent`` reference.
@@ -697,6 +714,29 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # and bedrock_converse alike.  No-op when the budget is off.
     if agent._tool_budget_reached():
         tools_for_api = None
+
+        # Companion to the tools-withhold above: on the FIRST budget-tripped
+        # completion call of the turn, append a one-time system-channel wrap-up
+        # so a model whose static system prompt still commands tool use knows
+        # tools are gone and a plain-text final answer is expected (otherwise
+        # enforcement-prompted local reasoning models return empty and the turn
+        # dies ``empty_response_exhausted`` — see ``_TOOL_BUDGET_WRAPUP_NOTE``).
+        #
+        # Placed at this single request-build choke point — the same layer as
+        # the tools gate above — so it is visible to every api_mode
+        # (chat_completions, anthropic_messages, codex_responses,
+        # bedrock_converse) with no per-transport duplication.  A system-role
+        # message, never a synthetic user message mid-loop (AGENTS.md).  Injected
+        # exactly once per turn: the ``_tool_budget_wrapup_injected`` flag is
+        # reset alongside ``_tools_dispatched_this_turn`` at turn start, so
+        # network retries that reuse this same ``api_messages`` list, and
+        # empty-response retries that rebuild it, never duplicate the note.
+        # No-op when the budget is off (``_tool_budget_reached()`` is False).
+        if not getattr(agent, "_tool_budget_wrapup_injected", False):
+            api_messages.append(
+                {"role": "system", "content": _TOOL_BUDGET_WRAPUP_NOTE}
+            )
+            agent._tool_budget_wrapup_injected = True
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

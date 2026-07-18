@@ -2388,6 +2388,22 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
                 ]
 
 
+def _flatten_system_text(content: Any) -> str:
+    """Flatten a system message's content to a plain string.
+
+    Used only when accumulating a SECOND-or-later system message into the
+    already-extracted primary prompt (see ``convert_messages_to_anthropic``).
+    Text content blocks are joined; a bare string is returned as-is.
+    """
+    if isinstance(content, list):
+        return "\n".join(
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return content if isinstance(content, str) else ""
+
+
 def convert_messages_to_anthropic(
     messages: List[Dict],
     base_url: str | None = None,
@@ -2418,19 +2434,37 @@ def convert_messages_to_anthropic(
         content = m.get("content", "")
 
         if role == "system":
-            if isinstance(content, list):
-                # Preserve cache_control markers on content blocks
-                has_cache = any(
-                    p.get("cache_control") for p in content if isinstance(p, dict)
-                )
-                if has_cache:
-                    system = [p for p in content if isinstance(p, dict)]
-                else:
-                    system = "\n".join(
-                        p["text"] for p in content if p.get("type") == "text"
+            if system is None:
+                # First system message → primary system prompt. Preserved
+                # byte-for-byte (string, or cache_control block list) so the
+                # single-system-message case is identical to before.
+                if isinstance(content, list):
+                    # Preserve cache_control markers on content blocks
+                    has_cache = any(
+                        p.get("cache_control") for p in content if isinstance(p, dict)
                     )
+                    if has_cache:
+                        system = [p for p in content if isinstance(p, dict)]
+                    else:
+                        system = "\n".join(
+                            p["text"] for p in content if p.get("type") == "text"
+                        )
+                else:
+                    system = content
             else:
-                system = content
+                # Additional system message (e.g. the one-time tool-budget
+                # wrap-up appended by build_api_kwargs). Anthropic takes a single
+                # system param, so ACCUMULATE rather than overwrite — otherwise a
+                # trailing system note would clobber the byte-stable primary
+                # prompt. This mirrors the Bedrock adapter (appends system
+                # blocks) and Gemini adapter (joins system parts); Anthropic was
+                # the lone last-writer-wins outlier.
+                extra_text = _flatten_system_text(content)
+                if extra_text:
+                    if isinstance(system, list):
+                        system = system + [{"type": "text", "text": extra_text}]
+                    else:
+                        system = (system or "") + "\n\n" + extra_text
             continue
 
         if role == "assistant":
