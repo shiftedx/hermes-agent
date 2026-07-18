@@ -2763,11 +2763,22 @@ class AIAgent:
         Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
         before the drain point concatenate with newlines.
 
+        Atomicity contract (see ``_seal_and_drain_pending_steer``): the
+        turn-END drain seals this slot under ``_pending_steer_lock``.  A
+        ``steer()`` that loses the cross-thread race with that terminal
+        drain — i.e. lands after the finalizing turn has already drained —
+        is REJECTED here (returns False) instead of being stashed onto an
+        agent whose turn is over.  The gateway busy-steer path treats a
+        False return as "could not fold" and re-delivers the text as a
+        queued follow-up turn, so the steer is never stranded (shape 1) and
+        never both folded AND resubmitted (shape 2).
+
         Args:
             text: The user text to inject. Empty strings are ignored.
 
         Returns:
-            True if the steer was accepted, False if the text was empty.
+            True if the steer was accepted, False if the text was empty OR
+            the current turn has already sealed its steer slot.
         """
         if not text or not text.strip():
             return False
@@ -2777,10 +2788,16 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if getattr(self, "_pending_steer_sealed", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if getattr(self, "_pending_steer_sealed", False):
+                # Turn already drained + sealed its steer slot; folding here
+                # would strand the text.  Reject so the caller re-queues it.
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
@@ -2801,6 +2818,38 @@ class AIAgent:
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+        return text
+
+    def _seal_and_drain_pending_steer(self) -> Optional[str]:
+        """Terminal, one-shot drain of the pending steer at turn END.
+
+        Atomically (under ``_pending_steer_lock``) captures + clears the
+        pending steer AND sets ``_pending_steer_sealed`` so no further
+        ``steer()`` can stash onto this finalizing turn.  This closes the
+        cross-thread TOCTOU between the gateway busy-steer handler (event
+        loop: reads ``_running_agents`` then calls ``agent.steer()``) and
+        the turn finalizer (executor thread: drains the steer and lets the
+        gateway release the session slot).  Either the steer landed before
+        this seal — in which case it is returned here and the caller
+        delivers it as the next turn — or it lands after and ``steer()``
+        rejects it for the caller to re-queue.  A steer can therefore never
+        be stranded on an already-finalized agent, and never be both folded
+        here AND independently resubmitted.
+
+        Distinct from ``_drain_pending_steer`` (the non-sealing MID-loop
+        drain used before an API call and after each tool batch, which must
+        NOT seal because the turn is still accepting steers).
+        """
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            self._pending_steer_sealed = True
+            return text
+        with _lock:
+            text = self._pending_steer
+            self._pending_steer = None
+            self._pending_steer_sealed = True
         return text
 
     def _record_file_mutation_result(

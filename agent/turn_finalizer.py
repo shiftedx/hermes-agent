@@ -461,7 +461,24 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    #
+    # Use the SEALING drain: this is the turn's terminal steer boundary.
+    # Sealing atomically forecloses the cross-thread window in which a
+    # gateway busy-steer (event loop) could stash onto this agent AFTER the
+    # finalizer drained but BEFORE the session slot is released — such a
+    # steer would otherwise be stranded forever (shape 1).  After the seal,
+    # a racing steer() rejects and the gateway re-queues it as one follow-up
+    # turn.  A steer that landed before the seal is captured right here.
+    #
+    # ``getattr`` fallback covers hand-rolled test stubs that implement only
+    # the older ``_drain_pending_steer`` (the real AIAgent always has the
+    # sealing variant — see run_agent.py).  Stubs don't exercise the
+    # cross-thread race, so the non-sealing drain is equivalent for them.
+    _seal_drain = getattr(agent, "_seal_and_drain_pending_steer", None)
+    if callable(_seal_drain):
+        _leftover_steer = _seal_drain()
+    else:
+        _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
